@@ -13,6 +13,7 @@ typedef enum{
 typedef struct {
   char* name;
   unsigned int size;
+  uint16_t crc;
 } stHeaderEntry;
 
 int createTar(int nFiles, char *fileNames[], char tarName[]);

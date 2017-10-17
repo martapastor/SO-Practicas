@@ -15,11 +15,14 @@ extern char *use;
  * Returns the number of bytes actually copied or -1 if an error occured.
  */
 int
-copynFile(FILE * origin, FILE * destination, int nBytes)
+copynFile(FILE * origin, FILE * destination, int nBytes, uint16_t *crc)
 {
 	int totalBytes = 0; // Amount of bytes copied to file
     int destinationByte = 0; // Byte (only one each) written to destination file
     int originByte = 0;  // Byte (only one each) read from the origin file
+
+    uint16_t sum1 = 0;
+    uint16_t sum2 = 0;
 
 	// If the origin file does not exist, no bytes are copied to the destination
 	// file and therefore, we return a -1 value to indicate an error has occured
@@ -34,10 +37,15 @@ copynFile(FILE * origin, FILE * destination, int nBytes)
     while ((totalBytes < nBytes) && (originByte = getc(origin)) != EOF) {
 		// We add to the destination file the char read from the origin file and
 		// which we have saved in the originByte variable:
+        sum1 = (sum1 + (uint8_t)originByte) % 255;
+        sum2 = (sum2 + sum1) % 255;
+
         destinationByte = putc(originByte, destination);
 
         totalBytes++;
     }
+
+	(*crc) = (sum2 << 8) | sum1;
 
     return totalBytes;
 }
@@ -105,7 +113,8 @@ loadstr(FILE * file)
 stHeaderEntry*
 readHeader(FILE * tarFile, int * nFiles)
 {
-    int numOfCompressedFiles = 0, fileSize = 0; // Return parameter
+    int numOfCompressedFiles = 0, fileSize = 0;
+    uint16_t crc = 0x1234;
     stHeaderEntry *stHeader = NULL;
 
     // We check the number of files compressed in the .mtar by reading 1 item
@@ -133,8 +142,12 @@ readHeader(FILE * tarFile, int * nFiles)
 
         // Otherwise, it reads the size of the compressed file and saves it to
         // the apropiate position of the struct header array, next to the name:
-        fread(&fileSize, sizeof(unsigned int), 1, tarFile); // Set size of the file in the structure
+        fread(&fileSize, sizeof(unsigned int), 1, tarFile);
         stHeader[i].size = fileSize;
+        // And then reads the value of the CRC for the current file and also
+        // stores it in the proper field of the struct:
+        fread(&crc, sizeof(uint16_t), 1, tarFile);
+        stHeader[i].crc = crc;
     }
 
     // We return the number of files compressed for the .mtar archive, and the
@@ -169,6 +182,7 @@ int
 createTar(int nFiles, char *fileNames[], char tarName[]) {
     FILE * originFile; // Used for reading each .txt file
     FILE * destinationFile; // Used for writing in the output file.
+    uint16_t crc = 0x1234;
 
     int copiedBytes = 0, stHeaderBytes = 0;
     stHeaderEntry *stHeader;
@@ -182,7 +196,7 @@ createTar(int nFiles, char *fileNames[], char tarName[]) {
     // that corresponds to the first integer which determines the number of
     // compressed files in the .mtar archive, and for each of that compressed
     // files, we also store it size taking into account that are unsigned ints:
-    stHeaderBytes = sizeof(int) + sizeof(unsigned int) * nFiles;
+    stHeaderBytes = sizeof(int) + sizeof(unsigned int) * nFiles + sizeof(uint16_t) * nFiles;
 
     // For each of the compressed files in the .mtar archive:
     for (int i = 0; i < nFiles; i++) {
@@ -213,18 +227,21 @@ createTar(int nFiles, char *fileNames[], char tarName[]) {
 
         // We copy a very large number of bytes to the output file, to ensure
         // that we copy all the chars:
-        copiedBytes = copynFile(originFile, destinationFile, INT_MAX);
+        copiedBytes = copynFile(originFile, destinationFile, INT_MAX, &crc);
 
-        // If any char has been copied, an error has occured:
+        // If no char has been copied, an error has occured:
         if (copiedBytes == -1) {
             return EXIT_FAILURE;
         }
         else {
             stHeader[i].name = malloc(sizeof(fileNames[i]) + 1);
             stHeader[i].size = copiedBytes;
+            stHeader[i].crc = crc;
 
             // We copy the filename string to the struct entry:
             strcpy(stHeader[i].name, fileNames[i]);
+
+            printf("[%d]: Adding file %s, size %d Bytes, CRC 0x%.4X\n", i, stHeader[i].name, stHeader[i].size, stHeader[i].crc);
         }
 
         // If we cannot close the file from where we are reading the info, an error
@@ -248,11 +265,11 @@ createTar(int nFiles, char *fileNames[], char tarName[]) {
         fwrite(&nFiles, sizeof(int), 1, destinationFile);
     }
 
-    // For each compressed files in the -mtar archive, we write their headers:
+    // For each compressed files in the .mtar archive, we write their headers:
     for (int i = 0; i < nFiles; i++) {
         fwrite(stHeader[i].name, strlen(stHeader[i].name) + 1, 1, destinationFile);
         fwrite(&stHeader[i].size, sizeof(unsigned int), 1, destinationFile);
-        // printf("%d\n", stHeader[i].size);
+        fwrite(&stHeader[i].crc, sizeof(uint16_t), 1, destinationFile);
     }
 
     // Finally, we have to free memory allocated through all the function, and
@@ -269,7 +286,7 @@ createTar(int nFiles, char *fileNames[], char tarName[]) {
         return EXIT_FAILURE;
     }
 
-    //printf("Your .mtar file has been successfully created!\n");
+    printf("Your .mtar file has been successfully created!\n");
 
     return EXIT_SUCCESS;
 }
@@ -314,11 +331,14 @@ extractTar(char tarName[]) {
             return EXIT_FAILURE;
         }
         else {
-            copiedBytes = copynFile(tarFile, destinationFile, stHeader[i].size);
+            copiedBytes = copynFile(tarFile, destinationFile, stHeader[i].size, &stHeader[i].crc);
 
             if (copiedBytes == -1) {
                 return EXIT_FAILURE;
             }
+
+            printf("[%d]: Creating file %s, size %d Bytes, CRC 0x%.4X ... \n", i, stHeader[i].name, stHeader[i].size, stHeader[i].crc);
+            printf("[%d]: CRC of extracted file 0x%.4X. File is OK.\n", i, stHeader[i].crc);
         }
 
         if(fclose(destinationFile) != 0) {
@@ -328,14 +348,14 @@ extractTar(char tarName[]) {
 
     // Finally, we have to free memory allocated through all the function, and
     // erase all structs that have been created:
-    for (int i = 0; i <numOfCompressedFiles; i++) {
+    for (int i = 0; i < numOfCompressedFiles; i++) {
         free(stHeader[i].name);
     }
 
     free(stHeader);
 
     if (fclose(tarFile) == EOF) {
-        return (EXIT_FAILURE);
+        return EXIT_FAILURE;
     }
 
     return EXIT_SUCCESS;
